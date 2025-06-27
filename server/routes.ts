@@ -1,17 +1,27 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import { setupAuth, isAuthenticated } from "./replitAuth";
+import { setupAuth, isAuthenticated } from "./auth";
 import { z } from "zod";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import { registerMockRoutes } from "./mockRoutes";
+
+// Настройки загрузки файлов из переменных окружения
+const UPLOAD_DIR = process.env.UPLOAD_DIR || 'uploads';
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || '10485760'); // 10MB по умолчанию
+
+// Создаем директорию для загрузок, если её нет
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
 
 // Configure multer for file uploads
 const upload = multer({
-  dest: "uploads/",
+  dest: UPLOAD_DIR,
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
+    fileSize: MAX_FILE_SIZE,
   },
   fileFilter: (req, file, cb) => {
     const allowedTypes = /jpeg|jpg|png|gif|webp|svg|pdf|doc|docx/;
@@ -29,6 +39,11 @@ const upload = multer({
 export async function registerRoutes(app: Express): Promise<Server> {
   // Auth middleware
   await setupAuth(app);
+
+  // Регистрируем моковые маршруты если включен режим моковых данных
+  if (process.env.NODE_ENV === 'development' && process.env.USE_MOCK_STORAGE === 'true') {
+    registerMockRoutes(app);
+  }
 
   // Auth routes
   app.get('/api/auth/user', isAuthenticated, async (req: any, res) => {
@@ -334,7 +349,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Move file to permanent location
       const filename = `${Date.now()}-${req.file.originalname}`;
-      const finalPath = path.join("uploads", filename);
+      const finalPath = path.join(UPLOAD_DIR, filename);
       
       fs.renameSync(req.file.path, finalPath);
 
@@ -393,7 +408,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Serve uploaded files
   app.use('/uploads', (req, res, next) => {
-    const filePath = path.join(process.cwd(), 'uploads', req.path);
+    const filePath = path.join(process.cwd(), UPLOAD_DIR, req.path);
     if (fs.existsSync(filePath)) {
       res.sendFile(filePath);
     } else {

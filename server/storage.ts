@@ -29,8 +29,352 @@ import {
   type Consultation,
   type InsertConsultation,
 } from "@shared/schema";
-import { db } from "./db";
+import { db, dbConnectionFailed } from "./db";
 import { eq, desc, and, like, sql, inArray } from "drizzle-orm";
+import { mockUsers, mockPages, mockPosts, mockCategories, mockTags, mockPostTags } from "./mockData";
+
+// Создаем тестового пользователя для режима разработки
+const mockAdminUser: User = {
+  id: 'admin-user-id',
+  email: 'admin@example.com',
+  firstName: 'Администратор',
+  lastName: 'Системы',
+  role: 'admin',
+  createdAt: new Date(),
+  updatedAt: new Date(),
+  profileImageUrl: null,
+};
+
+// Класс для использования в режиме разработки без базы данных
+export class MockStorage implements IStorage {
+  // Храним все моковые данные в памяти
+  private users: User[] = [...mockUsers];
+  private pages: Page[] = [...mockPages];  
+  private posts: Post[] = [...mockPosts];
+  private categories: Category[] = [...mockCategories];
+  private tags: Tag[] = [...mockTags];
+  private postTags = [...mockPostTags];
+  private mediaItems: Media[] = [];
+  private formItems: Form[] = [];
+  private formSubmissions: FormSubmission[] = [];
+
+  async getUser(id: string): Promise<User | undefined> {
+    console.log('🔍 Запрос мок-пользователя:', id);
+    return this.users.find(user => user.id === id);
+  }
+
+  async upsertUser(userData: UpsertUser): Promise<User> {
+    console.log('🔄 Обновление мок-пользователя:', userData);
+    const existingIndex = this.users.findIndex(user => user.id === userData.id);
+    
+    if (existingIndex >= 0) {
+      // Обновляем существующего пользователя
+      const updatedUser = {
+        ...this.users[existingIndex],
+        ...userData,
+        updatedAt: new Date()
+      };
+      this.users[existingIndex] = updatedUser;
+      return updatedUser;
+    } else {
+      // Создаем нового пользователя
+      const newUser: User = {
+        ...userData,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        profileImageUrl: userData.profileImageUrl || null
+      } as User;
+      
+      this.users.push(newUser);
+      return newUser;
+    }
+  }
+
+  // Мок реализации страниц
+  async getAllPages(): Promise<Page[]> { 
+    console.log('📄 Получение всех страниц');
+    return this.pages.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+  }
+  
+  async getPublishedPages(): Promise<Page[]> { 
+    console.log('📄 Получение опубликованных страниц');
+    return this.pages
+      .filter(page => page.isPublished)
+      .sort((a, b) => (b.publishedAt?.getTime() || 0) - (a.publishedAt?.getTime() || 0));
+  }
+  
+  async getPageBySlug(slug: string): Promise<Page | undefined> {
+    console.log(`📄 Поиск страницы по slug: ${slug}`);
+    return this.pages.find(page => page.slug === slug);
+  }
+  
+  async createPage(page: InsertPage): Promise<Page> { 
+    console.log('📄 Создание новой страницы');
+    const newPage: Page = {
+      id: `page-${Date.now()}`,
+      ...page,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    } as Page;
+    
+    this.pages.push(newPage);
+    return newPage;
+  }
+  
+  async updatePage(id: string, page: Partial<InsertPage>): Promise<Page> { 
+    console.log(`📄 Обновление страницы: ${id}`);
+    const index = this.pages.findIndex(p => p.id === id);
+    
+    if (index === -1) {
+      throw new Error(`Page with id ${id} not found`);
+    }
+    
+    const updatedPage = {
+      ...this.pages[index],
+      ...page,
+      updatedAt: new Date()
+    };
+    
+    this.pages[index] = updatedPage;
+    return updatedPage;
+  }
+  
+  async deletePage(id: string): Promise<void> {
+    console.log(`📄 Удаление страницы: ${id}`);
+    const index = this.pages.findIndex(p => p.id === id);
+    
+    if (index !== -1) {
+      this.pages.splice(index, 1);
+    }
+  }
+
+  // Мок реализации постов
+  async getAllPosts(): Promise<Post[]> { 
+    console.log('📝 Получение всех постов');
+    return this.posts.map(post => {
+      const category = this.categories.find(c => c.id === post.categoryId);
+      return {
+        ...post,
+        category: category ? {
+          id: category.id,
+          name: category.name,
+          slug: category.slug
+        } : undefined
+      };
+    }).sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+  }
+  
+  async getPublishedPosts(options: {
+    page: number;
+    limit: number;
+    categorySlug?: string;
+    tagSlug?: string;
+  }): Promise<{ posts: Post[]; total: number }> { 
+    console.log('📝 Получение опубликованных постов', options);
+    const { page, limit, categorySlug, tagSlug } = options;
+    const offset = (page - 1) * limit;
+    
+    // Фильтрация по published
+    let filteredPosts = this.posts.filter(post => post.isPublished);
+    
+    // Фильтрация по категории
+    if (categorySlug) {
+      const categoryId = this.categories.find(c => c.slug === categorySlug)?.id;
+      if (categoryId) {
+        filteredPosts = filteredPosts.filter(post => post.categoryId === categoryId);
+      }
+    }
+    
+    // Фильтрация по тегу
+    if (tagSlug) {
+      const tagId = this.tags.find(t => t.slug === tagSlug)?.id;
+      if (tagId) {
+        const postIdsWithTag = this.postTags
+          .filter(pt => pt.tagId === tagId)
+          .map(pt => pt.postId);
+        filteredPosts = filteredPosts.filter(post => postIdsWithTag.includes(post.id));
+      }
+    }
+    
+    // Сортировка
+    filteredPosts = filteredPosts.sort((a, b) => 
+      (b.publishedAt?.getTime() || 0) - (a.publishedAt?.getTime() || 0)
+    );
+    
+    // Пагинация
+    const paginatedPosts = filteredPosts.slice(offset, offset + limit);
+    
+    // Добавляем категории к постам
+    const postsWithCategories = paginatedPosts.map(post => {
+      const category = this.categories.find(c => c.id === post.categoryId);
+      return {
+        ...post,
+        category: category ? {
+          id: category.id,
+          name: category.name,
+          slug: category.slug
+        } : undefined
+      };
+    });
+    
+    return {
+      posts: postsWithCategories,
+      total: filteredPosts.length
+    };
+  }
+  
+  async getPostBySlug(slug: string): Promise<Post | undefined> {
+    console.log(`📝 Поиск поста по slug: ${slug}`);
+    const post = this.posts.find(p => p.slug === slug);
+    
+    if (!post) return undefined;
+    
+    const category = this.categories.find(c => c.id === post.categoryId);
+    return {
+      ...post,
+      category: category ? {
+        id: category.id,
+        name: category.name,
+        slug: category.slug
+      } : undefined
+    };
+  }
+  
+  async createPost(post: InsertPost): Promise<Post> {
+    console.log('📝 Создание нового поста');
+    const newPost: Post = {
+      id: `post-${Date.now()}`,
+      ...post,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    } as Post;
+    
+    this.posts.push(newPost);
+    return newPost;
+  }
+  
+  async updatePost(id: string, post: Partial<InsertPost>): Promise<Post> {
+    console.log(`📝 Обновление поста: ${id}`);
+    const index = this.posts.findIndex(p => p.id === id);
+    
+    if (index === -1) {
+      throw new Error(`Post with id ${id} not found`);
+    }
+    
+    const updatedPost = {
+      ...this.posts[index],
+      ...post,
+      updatedAt: new Date()
+    };
+    
+    this.posts[index] = updatedPost;
+    return updatedPost;
+  }
+  
+  async deletePost(id: string): Promise<void> {
+    console.log(`📝 Удаление поста: ${id}`);
+    const index = this.posts.findIndex(p => p.id === id);
+    
+    if (index !== -1) {
+      this.posts.splice(index, 1);
+      
+      // Удаляем связи с тегами
+      this.postTags = this.postTags.filter(pt => pt.postId !== id);
+    }
+  }
+
+  // Мок реализации категорий
+  async getCategories(): Promise<Category[]> { 
+    console.log('🏷️ Получение категорий');
+    return [...this.categories].sort((a, b) => a.name.localeCompare(b.name));
+  }
+  
+  async createCategory(category: InsertCategory): Promise<Category> {
+    console.log('🏷️ Создание новой категории');
+    const newCategory: Category = {
+      id: `cat-${Date.now()}`,
+      ...category,
+      createdAt: new Date()
+    };
+    
+    this.categories.push(newCategory);
+    return newCategory;
+  }
+
+  // Мок реализации тегов
+  async getTags(): Promise<Tag[]> { 
+    console.log('🔖 Получение тегов');
+    return [...this.tags].sort((a, b) => a.name.localeCompare(b.name)); 
+  }
+  
+  async createTag(tag: InsertTag): Promise<Tag> {
+    console.log('🔖 Создание нового тега');
+    const newTag: Tag = {
+      id: `tag-${Date.now()}`,
+      ...tag,
+      createdAt: new Date()
+    };
+    
+    this.tags.push(newTag);
+    return newTag;
+  }
+
+  // Остальные методы оставляем как есть
+  async getMediaLibrary(): Promise<Media[]> { return this.mediaItems.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()); }
+  
+  async createMedia(media: InsertMedia): Promise<Media> {
+    const newMedia: Media = {
+      id: `media-${Date.now()}`,
+      ...media,
+      createdAt: new Date()
+    };
+    this.mediaItems.push(newMedia);
+    return newMedia;
+  }
+  
+  async deleteMedia(id: string): Promise<void> {
+    const index = this.mediaItems.findIndex(m => m.id === id);
+    if (index !== -1) {
+      this.mediaItems.splice(index, 1);
+    }
+  }
+  
+  async getForms(): Promise<Form[]> { return this.formItems; }
+  async getForm(id: string): Promise<Form | undefined> { return this.formItems.find(f => f.id === id); }
+  
+  async createForm(form: InsertForm): Promise<Form> {
+    const newForm: Form = {
+      id: `form-${Date.now()}`,
+      ...form,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    } as Form;
+    this.formItems.push(newForm);
+    return newForm;
+  }
+  
+  async createFormSubmission(submission: InsertFormSubmission): Promise<FormSubmission> {
+    const newSubmission: FormSubmission = {
+      id: `submission-${Date.now()}`,
+      ...submission,
+      createdAt: new Date()
+    } as FormSubmission;
+    this.formSubmissions.push(newSubmission);
+    return newSubmission;
+  }
+  
+  async createConsultation(consultation: InsertConsultation): Promise<Consultation> {
+    return {
+      id: `consultation-${Date.now()}`,
+      ...consultation,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    } as Consultation;
+  }
+  
+  async trackAnalytics(data: any): Promise<void> {}
+  async getAnalytics(options: any): Promise<any[]> { return []; }
+}
 
 export interface IStorage {
   // User operations (required for Replit Auth)
@@ -99,23 +443,49 @@ export interface IStorage {
 export class DatabaseStorage implements IStorage {
   // User operations (required for Replit Auth)
   async getUser(id: string): Promise<User | undefined> {
-    const [user] = await db.select().from(users).where(eq(users.id, id));
-    return user;
+    try {
+      const [user] = await db.select().from(users).where(eq(users.id, id));
+      return user;
+    } catch (error) {
+      console.error("❌ Ошибка при получении пользователя:", error);
+      return undefined;
+    }
   }
 
   async upsertUser(userData: UpsertUser): Promise<User> {
-    const [user] = await db
-      .insert(users)
-      .values(userData)
-      .onConflictDoUpdate({
-        target: users.id,
-        set: {
-          ...userData,
+    try {
+      const [user] = await db
+        .insert(users)
+        .values(userData)
+        .onConflictDoUpdate({
+          target: users.id,
+          set: {
+            ...userData,
+            updatedAt: new Date(),
+          },
+        })
+        .returning();
+      return user;
+    } catch (error) {
+      console.error("❌ Ошибка при обновлении пользователя:", error);
+      
+      // В случае ошибки, пробуем создать фиктивного пользователя для разработки
+      if (process.env.NODE_ENV === 'development') {
+        console.warn("⚠️ Создаю фиктивного пользователя для локальной разработки");
+        return {
+          id: userData.id || 'admin-user-id',
+          email: userData.email || 'admin@example.com',
+          firstName: userData.firstName || 'Администратор',
+          lastName: userData.lastName || 'Системы',
+          role: 'admin',
+          createdAt: new Date(),
           updatedAt: new Date(),
-        },
-      })
-      .returning();
-    return user;
+          profileImageUrl: null,
+        };
+      }
+      
+      throw error;
+    }
   }
 
   // Page operations
@@ -402,4 +772,16 @@ export class DatabaseStorage implements IStorage {
   }
 }
 
-export const storage = new DatabaseStorage();
+// Выбираем правильную реализацию хранилища в зависимости от состояния подключения
+let storageImplementation: IStorage;
+
+if (process.env.NODE_ENV === 'development' && (dbConnectionFailed || process.env.USE_MOCK_STORAGE === 'true')) {
+  console.log('🗄️ Используется мок-хранилище данных');
+  storageImplementation = new MockStorage();
+} else {
+  console.log('🗄️ Используется хранилище PostgreSQL');
+  storageImplementation = new DatabaseStorage();
+}
+
+// Экспортируем правильную реализацию хранилища
+export const storage = storageImplementation;

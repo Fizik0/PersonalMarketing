@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
@@ -59,12 +60,19 @@ app.use((req, res, next) => {
   // ALWAYS serve the app on port 5000
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
-  const port = 5000;
-  server.listen({
+  const port = process.env.PORT ? parseInt(process.env.PORT) : 5000;
+  
+  // Определяем операционную систему для настройки параметров сервера
+  const isWindows = process.platform === 'win32';
+  
+  const serverOptions = {
     port,
     host: "0.0.0.0",
-    reusePort: true,
-  }, () => {
+    // Отключаем опцию reusePort для Windows
+    ...(isWindows ? {} : { reusePort: true }),
+  };
+  
+  server.listen(serverOptions, () => {
     log(`serving on port ${port}`);
   });
 })();
